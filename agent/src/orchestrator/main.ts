@@ -1,8 +1,6 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
-import type { Options } from '@anthropic-ai/claude-agent-sdk';
+import { spawn } from 'child_process';
 import chalk from 'chalk';
 
-import { analyzerAgentDefinition, fixerAgentDefinition } from '../agents/definitions.js';
 import { ConflictDetector } from './conflict.js';
 import { StateManager } from './state.js';
 import { ApprovalQueue } from '../approval/queue.js';
@@ -74,72 +72,53 @@ export class MainOrchestrator {
       });
     }
 
-    // 5. 메인 에이전트 실행 (서브에이전트 조율)
-    const sdkOptions: Options = {
-      cwd: this.config.projectPath,
-      permissionMode: 'default',
-
-      // 서브에이전트 정의
-      agents: {
-        'issue-analyzer': analyzerAgentDefinition,
-        'issue-fixer': fixerAgentDefinition,
-      },
-
-      // MCP GitHub 서버 연결
-      mcpServers: {
-        github: {
-          type: 'stdio',
-          command: 'npx',
-          args: ['-y', '@modelcontextprotocol/server-github'],
-          env: {
-            GITHUB_PERSONAL_ACCESS_TOKEN: envConfig.githubToken,
-          },
-        },
-      },
-
-      // 허용 도구
-      allowedTools: [
-        'Task',
-        'Read',
-        'Edit',
-        'Write',
-        'Glob',
-        'Grep',
-        'Bash',
-      ],
-
-      // 커스텀 권한 핸들러
-      canUseTool: async (toolName, input) => {
-        // 승인이 필요한 작업 처리
-        if (this.requiresApproval(toolName)) {
-          const approved = await this.approvalQueue.requestToolApproval(
-            toolName,
-            input as Record<string, unknown>
-          );
-          return approved
-            ? { behavior: 'allow' as const, updatedInput: input }
-            : { behavior: 'deny' as const, message: '사용자가 거부함' };
-        }
-        return { behavior: 'allow' as const, updatedInput: input };
-      },
-    };
-
-    // 6. 오케스트레이터 프롬프트 실행
-    const orchestratorPrompt = this.buildOrchestratorPrompt(issueGroups, state);
-
+    // 5. Claude Code CLI로 각 이슈 처리
     console.log(chalk.green('🚀 에이전트 실행 중...\n'));
 
-    try {
-      for await (const message of query({
-        prompt: orchestratorPrompt,
-        options: sdkOptions,
-      })) {
-        await this.handleMessage(message, state);
+    for (const group of issueGroups) {
+      for (const issue of group) {
+        const agentKey = `issue-${issue.number}`;
+
+        // 이미 처리된 이슈 스킵
+        if (state.completedIssues.includes(issue.number) ||
+            state.rejectedIssues.includes(issue.number) ||
+            state.errorIssues.includes(issue.number)) {
+          console.log(chalk.gray(`   ⏭️ #${issue.number} 이미 처리됨, 스킵`));
+          continue;
+        }
+
+        console.log(chalk.blue(`\n📌 이슈 #${issue.number} 처리 중: ${issue.title}`));
+
+        state.agents[agentKey] = {
+          status: 'running',
+          issueNumber: issue.number,
+          startedAt: new Date().toISOString(),
+        };
+        await this.stateManager.save(state);
+
+        try {
+          const result = await this.runClaudeCode(issue);
+
+          if (result.success) {
+            state.agents[agentKey].status = 'done';
+            state.agents[agentKey].prNumber = result.prNumber;
+            state.completedIssues.push(issue.number);
+            console.log(chalk.green(`   ✅ #${issue.number} 완료`));
+          } else {
+            state.agents[agentKey].status = 'error';
+            state.agents[agentKey].error = result.error;
+            state.errorIssues.push(issue.number);
+            console.log(chalk.red(`   ❌ #${issue.number} 실패: ${result.error}`));
+          }
+        } catch (error) {
+          state.agents[agentKey].status = 'error';
+          state.agents[agentKey].error = (error as Error).message;
+          state.errorIssues.push(issue.number);
+          console.log(chalk.red(`   ❌ #${issue.number} 오류: ${(error as Error).message}`));
+        }
+
         await this.stateManager.save(state);
       }
-    } catch (error) {
-      console.error(chalk.red('\n❌ 에이전트 실행 중 오류 발생:'), error);
-      await this.stateManager.save(state);
     }
 
     // 7. 최종 결과 요약
@@ -151,105 +130,156 @@ export class MainOrchestrator {
     }
   }
 
-  private buildOrchestratorPrompt(
-    issueGroups: Issue[][],
-    state: OrchestratorState
-  ): string {
-    const groupsDescription = issueGroups
-      .map((group, i) => {
-        const issues = group
-          .map((issue) => `- #${issue.number}: ${issue.title}`)
-          .join('\n');
-        const warning =
-          group.length > 1
-            ? '\n⚠️ 이 이슈들은 같은 파일을 수정할 수 있어 함께 처리합니다.'
-            : '';
-        return `### 그룹 ${i + 1}\n${issues}${warning}`;
-      })
-      .join('\n\n');
+  /**
+   * Claude Code CLI를 사용하여 이슈 처리
+   */
+  private async runClaudeCode(issue: Issue): Promise<{ success: boolean; prNumber?: number; error?: string }> {
+    const envConfig = loadEnvConfig();
 
-    return `
-당신은 GitHub 이슈를 처리하는 오케스트레이터 에이전트입니다.
+    const prompt = `
+GitHub 이슈를 분석하고 수정해주세요.
 
-## 프로젝트 정보
+## 이슈 정보
+- 번호: #${issue.number}
+- 제목: ${issue.title}
+- 내용: ${issue.body}
+- 라벨: ${issue.labels.join(', ') || '없음'}
+
+## 저장소 정보
 - Owner: ${this.config.owner}
 - Repo: ${this.config.repo}
-- 경로: ${this.config.projectPath}
 
-## 처리할 이슈 그룹
+## 작업 순서
+1. 이슈 내용을 분석하여 수정이 필요한 파일과 변경 사항을 파악
+2. 코드를 수정 (Edit 도구 사용)
+3. 수정 완료 후 브랜치 생성 및 커밋
+4. PR 생성 (mcp__github__create_pull_request 사용)
+5. 결과를 JSON으로 출력: {"success": true, "prNumber": 123} 또는 {"success": false, "error": "오류 메시지"}
 
-${groupsDescription}
-
-## 지시사항
-
-각 이슈 그룹에 대해 다음을 수행하세요:
-
-1. **분석 단계**: 'issue-analyzer' 서브에이전트를 호출하여 이슈 분석
-2. **승인 대기**: 분석 결과를 이슈에 코멘트로 작성하고 사용자 승인 대기
-3. **수정 단계**: 승인 시 'issue-fixer' 서브에이전트를 호출하여 코드 수정
-4. **검증 단계**: 테스트, 린트, 타입체크 실행
-5. **PR 생성**: 검증 통과 시 PR 생성
-6. **완료**: 사용자 승인 후 이슈 닫기
-
-## 검증 명령어
-- 테스트: ${this.config.testCommand}
-- 린트: ${this.config.lintCommand}
-- 타입체크: ${this.config.typecheckCommand}
-
-## 중요 규칙
-
-- 여러 그룹을 **병렬로** 처리하세요 (Task 도구 동시 호출)
-- 각 그룹의 세션 ID를 추적하여 resume으로 연속 처리
-- 검증 실패 시 재시도 (최대 ${this.config.maxTestRetries}회)
-- 테스트 통과율 ${this.config.testPassThreshold}% 미만이면 중단
-
-## 현재 상태
-
-${JSON.stringify(state.agents, null, 2)}
+## 중요
+- 반드시 마지막에 JSON 결과를 출력하세요
+- PR 생성이 완료되면 success: true와 PR 번호를 포함하세요
 `;
+
+    return new Promise((resolve) => {
+      const args = [
+        '--print',
+        '--dangerously-skip-permissions',
+        '-p', prompt,
+      ];
+
+      console.log(chalk.gray(`   $ claude ${args.slice(0, 2).join(' ')} ...`));
+
+      const child = spawn('claude', args, {
+        cwd: this.config.projectPath,
+        shell: true,
+        env: {
+          ...process.env,
+          GITHUB_TOKEN: envConfig.githubToken,
+        },
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        const text = data.toString();
+        stdout += text;
+        // 실시간 출력
+        process.stdout.write(chalk.gray(text));
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        if (code !== 0) {
+          resolve({ success: false, error: `프로세스 종료 코드: ${code}\n${stderr}` });
+          return;
+        }
+
+        // JSON 결과 파싱 시도
+        const jsonMatch = stdout.match(/\{[\s\S]*"success"[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            const result = JSON.parse(jsonMatch[0]);
+            resolve(result);
+            return;
+          } catch {
+            // JSON 파싱 실패
+          }
+        }
+
+        // JSON 없으면 성공으로 간주
+        resolve({ success: true });
+      });
+
+      child.on('error', (error) => {
+        resolve({ success: false, error: error.message });
+      });
+    });
   }
 
   private async fetchOpenIssues(options: RunOptions): Promise<Issue[]> {
-    // 실제 구현에서는 MCP GitHub 서버를 통해 이슈를 조회
-    // 여기서는 오케스트레이터 프롬프트에서 직접 조회하도록 위임
-    // 또는 별도의 query로 먼저 조회할 수 있음
+    const envConfig = loadEnvConfig();
+    const { owner, repo } = this.config;
 
-    // 임시: GitHub API 직접 호출 대신 빈 배열 반환
-    // 실제로는 메인 query에서 MCP를 통해 조회
-    console.log(chalk.gray('   (MCP를 통해 이슈를 조회합니다)'));
+    try {
+      // GitHub REST API로 열린 이슈 조회
+      let url = `https://api.github.com/repos/${owner}/${repo}/issues?state=open&per_page=100`;
 
-    return [];
-  }
-
-  private requiresApproval(toolName: string): boolean {
-    const approvalRequiredTools = [
-      'mcp__github__create_pull_request',
-      'mcp__github__close_issue',
-      'mcp__github__merge_pull_request',
-    ];
-    return approvalRequiredTools.includes(toolName);
-  }
-
-  private async handleMessage(
-    message: unknown,
-    state: OrchestratorState
-  ): Promise<void> {
-    const msg = message as {
-      type: string;
-      subtype?: string;
-      message?: { content?: Array<{ text?: string; name?: string }> };
-    };
-
-    if (msg.type === 'assistant' && msg.message?.content) {
-      for (const block of msg.message.content) {
-        if ('text' in block && block.text) {
-          console.log(block.text);
-        } else if ('name' in block && block.name) {
-          console.log(chalk.cyan(`🔧 Tool: ${block.name}`));
-        }
+      // 라벨 필터
+      if (options.labels && options.labels.length > 0) {
+        url += `&labels=${options.labels.join(',')}`;
       }
-    } else if (msg.type === 'result') {
-      console.log(chalk.green(`\n✅ 완료: ${msg.subtype}`));
+
+      // 담당자 필터
+      if (options.assignee) {
+        url += `&assignee=${options.assignee}`;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${envConfig.githubToken}`,
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`GitHub API 오류: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json() as Array<{
+        number: number;
+        title: string;
+        body: string | null;
+        labels: Array<{ name: string }>;
+        assignee: { login: string } | null;
+        pull_request?: unknown;
+      }>;
+
+      // PR은 제외하고 이슈만 필터링
+      let issues: Issue[] = data
+        .filter(item => !item.pull_request)
+        .map(item => ({
+          number: item.number,
+          title: item.title,
+          body: item.body || '',
+          labels: item.labels.map(l => l.name),
+          assignee: item.assignee?.login,
+        }));
+
+      // 개수 제한
+      if (options.limit && options.limit > 0) {
+        issues = issues.slice(0, options.limit);
+      }
+
+      return issues;
+    } catch (error) {
+      console.error(chalk.red('이슈 조회 실패:'), (error as Error).message);
+      return [];
     }
   }
 

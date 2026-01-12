@@ -1,8 +1,15 @@
 import { execSync } from 'child_process';
 import { config as dotenvConfig } from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname, resolve } from 'path';
+
+// 현재 파일 경로 기준으로 .env 파일 로드
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const envPath = resolve(__dirname, '..', '.env');
 
 // .env 파일 로드
-dotenvConfig();
+dotenvConfig({ path: envPath });
 
 /**
  * 현재 디렉토리의 git remote origin에서 owner/repo 추출
@@ -55,7 +62,8 @@ export function validateGitHubToken(): void {
   if (!githubToken) {
     throw new Error(
       'GITHUB_TOKEN이 설정되지 않았습니다.\n' +
-        '.env 파일에 GITHUB_TOKEN=ghp_xxx 형식으로 설정해주세요.'
+        '시스템 환경 변수에 GITHUB_TOKEN을 설정해주세요.\n' +
+        '(Windows: 사용자 환경 변수, Linux/Mac: export GITHUB_TOKEN=ghp_xxx)'
     );
   }
 }
